@@ -2,7 +2,7 @@ import tensorflow as tf
 import tensorflow.keras.layers as layers
 import time
 import numpy as np
-from tqdm import tqdm
+#from tqdm import tqdm
 import random
 import scipy.io as scio
 import sys
@@ -15,7 +15,7 @@ import scipy.io
 
 import os
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "3"
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
 
 # d_model 就是词向量嵌入维度
@@ -184,6 +184,41 @@ class EncoderLayer(tf.keras.layers.Layer):
         return out2
 
 
+class DecoderLayer(tf.keras.layers.Layer):
+    def __init__(self, d_model, num_heads, dff, drop_rate=0.1):
+        super(DecoderLayer, self).__init__()
+
+        self.mha1 = MutilHeadAttention(d_model, num_heads)
+        self.mha2 = MutilHeadAttention(d_model, num_heads)
+
+        self.ffn = point_wise_feed_forward_network(d_model, dff)
+
+        self.layernorm1 = LayerNormalization(epsilon=1e-6)
+        self.layernorm2 = LayerNormalization(epsilon=1e-6)
+        self.layernorm3 = LayerNormalization(epsilon=1e-6)
+
+        self.dropout1 = layers.Dropout(drop_rate)
+        self.dropout2 = layers.Dropout(drop_rate)
+        self.dropout3 = layers.Dropout(drop_rate)
+
+    def call(self, inputs, encode_out, training,
+             look_ahead_mask, padding_mask):
+        # masked muti-head attention
+        att1, att_weight1 = self.mha1(inputs, inputs, inputs, look_ahead_mask)
+        att1 = self.dropout1(att1, training=training)
+        out1 = self.layernorm1(inputs + att1)
+        # muti-head attention
+        # 这里的输入和tensorflow的官方代码有出入
+        att2, att_weight2 = self.mha2(encode_out, encode_out, out1, padding_mask)
+        att2 = self.dropout2(att2, training=training)
+        out2 = self.layernorm2(out1 + att2)
+
+        ffn_out = self.ffn(out2)
+        ffn_out = self.dropout3(ffn_out, training=training)
+        out3 = self.layernorm3(out2 + ffn_out)
+
+        return out3, att_weight1, att_weight2
+
 
 class Encoder(layers.Layer):
     def __init__(self, n_layers, d_model, n_heads, ddf,
@@ -233,11 +268,46 @@ class Encoder(layers.Layer):
         return x_c
 
 
+class Decoder(layers.Layer):
+    def __init__(self, n_layers, d_model, n_heads, ddf,
+                 target_vocab_size, max_seq_len, drop_rate=0.1):
+        super(Decoder, self).__init__()
+
+        self.d_model = d_model
+        self.n_layers = n_layers
+
+        self.embedding = layers.Embedding(target_vocab_size, d_model)
+        self.pos_embedding = positional_encoding(max_seq_len, d_model)
+
+        self.decoder_layers = [DecoderLayer(d_model, n_heads, ddf, drop_rate)
+                               for _ in range(n_layers)]
+
+        self.dropout = layers.Dropout(drop_rate)
+
+    def call(self, inputs, encoder_out, training,
+             look_ahead_mark, padding_mark):
+        seq_len = tf.shape(inputs)[1]
+        attention_weights = {}
+        h = self.embedding(inputs)
+        h *= tf.math.sqrt(tf.cast(self.d_model, tf.float32))
+        h += self.pos_embedding[:, :seq_len, :]
+
+        h = self.dropout(h, training=training)
+        #         print('--------------------\n',h, h.shape)
+        # 叠加解码层
+        for i in range(self.n_layers):
+            h, att_w1, att_w2 = self.decoder_layers[i](h, encoder_out,
+                                                       training, look_ahead_mark,
+                                                       padding_mark)
+            attention_weights['decoder_layer{}_att_w1'.format(i + 1)] = att_w1
+            attention_weights['decoder_layer{}_att_w2'.format(i + 1)] = att_w2
+
+        return h, attention_weights
 
 
-class Segmentation(layers.Layer):
+class Pixel_Embed(layers.Layer):
     def __init__(self, max_seq_len, patch_size, shift, stride):
-        super(Segmentation, self).__init__()
+        super(Pixel_Embed, self).__init__()
         self.patch_size = patch_size
         self.shift = shift
         self.stride = stride
@@ -259,10 +329,10 @@ class Segmentation(layers.Layer):
         return inputs_patch
 
 
-class Dual_LSTM(layers.Layer):
+class Encoder_patch(layers.Layer):
     def __init__(self, batch_size, n_layers, d_model, n_heads, ddf,
                  input_vocab_size, patch_size, patch_num, drop_rate=0.1):
-        super(Dual_LSTM, self).__init__()
+        super(Encoder_patch, self).__init__()
 
         self.batch_size = batch_size
         self.n_layers = n_layers
@@ -297,9 +367,8 @@ class Dual_LSTM(layers.Layer):
         x_l1 = tf.reshape(x, [-1, self.patch_num, x.shape[1]]) # 1-patch scale LSTM
         # x = tf.transpose(x, [0, 1, 3, 2])
 
-        x_c = tf.reshape(x_l1, [-1, 12, 5, x_l1.shape[2]])
+        x_c = tf.reshape(x_l1, [-1, 4, 5, x_l1.shape[2]]) # 4=patch_num/5
         x_c = tf.reshape(x_c, [-1, x_c.shape[1], (x_c.shape[2]*x_c.shape[3])])
-
         x_l2 = self.lstm3(x_c)
 
         x_out1 = self.down_layer2(x_c)
@@ -319,9 +388,9 @@ class Transformer(tf.keras.Model):
 
         self.num_class = num_class
         self.max_seq_len_de = max_seq_len_de
-        self.seg = Segmentation(max_seq_len_en, patch_size, shift, stride)
+        self.pix_emb = Pixel_Embed(max_seq_len_en, patch_size, shift, stride)
 
-        self.dual_lstm = Dual_LSTM(batch_size, n_layers, d_model, n_heads, diff,
+        self.encoder_patch = Encoder_patch(batch_size, n_layers, d_model, n_heads, diff,
                                            input_vocab_size, patch_size, patch_num, drop_rate)
 
         self.encoder = Encoder(n_layers, d_model, n_heads, diff,
@@ -335,18 +404,18 @@ class Transformer(tf.keras.Model):
         self.fnn1 = tf.keras.layers.Dense(d_model*2)
         self.fnn2 = tf.keras.layers.Dense(d_model*2)
 
-        self.fnn3 = tf.keras.layers.Dense(num_class*10)
-        self.fnn4 = tf.keras.layers.Dense(max_seq_len_de*10)
+        self.fnn3 = tf.keras.layers.Dense(num_class*max_seq_len_de)
+        self.fnn4 = tf.keras.layers.Dense(max_seq_len_de*2)
 
         self.final_layer1 = tf.keras.layers.Dense(num_class, activation='softmax')
-        self.final_layer2 = tf.keras.layers.Dense(max_seq_len_de, activation='sigmoid')
+        self.final_layer2 = tf.keras.layers.Dense(2, activation='sigmoid')
 
     def call(self, inputs, targets, training, encode_padding_mask,
              look_ahead_mask, decode_padding_mask):
-        pix_out = self.seg(inputs)
+        pix_out = self.pix_emb(inputs)
 
         encode_padding_mask_patch = create_padding_mark(pix_out)
-        encode_patch_out1, encode_patch_out2 = self.dual_lstm(pix_out, training, encode_padding_mask_patch)
+        encode_patch_out1, encode_patch_out2 = self.encoder_patch(pix_out, training, encode_padding_mask_patch)
         encode_patch_out_mask = encode_patch_out1[:, :, 0]+1
 
         encode_padding_mask = create_padding_mark(encode_patch_out_mask)
@@ -355,13 +424,13 @@ class Transformer(tf.keras.Model):
         encode_lstm1 = self.final_l1(encode_out)
         encode_fnn1 = self.fnn1(encode_lstm1)
         encode_fnn3 = self.fnn3(encode_fnn1)
-        encode_fnn3 = tf.reshape(encode_fnn3, [-1, 10, self.num_class])
+        encode_fnn3 = tf.reshape(encode_fnn3, [-1, self.max_seq_len_de, self.num_class])
         final_out1 = self.final_layer1(encode_fnn3)
 
         encode_lstm2 = self.final_l2(encode_out)
         encode_fnn2 = self.fnn2(encode_lstm2)
         encode_fnn4 = self.fnn4(encode_fnn2)
-        encode_fnn4 = tf.reshape(encode_fnn4, [-1, 10, self.max_seq_len_de])
+        encode_fnn4 = tf.reshape(encode_fnn4, [-1, self.max_seq_len_de, 2])
         final_out2 = self.final_layer2(encode_fnn4)
 
         return final_out1, final_out2
@@ -544,6 +613,7 @@ if __name__ == '__main__':
     print('var_box_shape:{}'.format(params_PRI_var.shape))
     print('var_cate_shape:{}'.format(params_cate_var.shape))
 
+
     #    data_var = data_var.astype(np.int16)
     params_cate_var = params_cate_var.astype(np.int16)
     params_PRI_var = params_PRI_var.astype(np.int16)
@@ -558,13 +628,13 @@ if __name__ == '__main__':
     num_heads = 4
     max_seq_len_en = data_train.shape[1]  # encoder max seq len
     print(max_seq_len_en)
-    max_seq_len_de =params_PRI_train.shape[2]  # decoder max seq len
+    max_seq_len_de =params_PRI_train.shape[1]  # decoder max seq len
     print(max_seq_len_de)
 
     dropout_rate = 0.1
     # checkpoint_path1 = './checkpoint/train2'
     EPOCHS = 100
-    checkpoint_path = './train_model'
+    checkpoint_path = 'train_model_6d'
     print('checkpoint_path: %s' % checkpoint_path)
     # train_dataset = data_import.train_dataset
 
@@ -593,7 +663,7 @@ if __name__ == '__main__':
     # ckpt管理器
     ckpt_manager = tf.train.CheckpointManager(ckpt, checkpoint_path, max_to_keep=5)
     # 加载最新一次的训练结果
-#    ckpt.restore(ckpt_manager.latest_checkpoint)
+    ckpt.restore(ckpt_manager.latest_checkpoint)
 
     metrics_max = []
     for epoch in range(EPOCHS):
@@ -617,9 +687,9 @@ if __name__ == '__main__':
         if (epoch + 1) % 100 == 0:
             box_pred, cate_pred = evaluate(data_var, target_vocab_size, max_seq_len_de)
             box_pred = box_pred.numpy()
+                # 计算交并比
 
-
-        if (epoch + 1) % 99 == 0:
+        if (epoch + 1) % 101 == 0:
             ckpt_save_path = ckpt_manager.save()
             print('epoch {}, save model at {}'.format(
                 epoch + 1, ckpt_save_path
